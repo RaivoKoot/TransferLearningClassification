@@ -1,0 +1,784 @@
+# In this notebook we will build and train a Convolutional Neural Network for classifying images as food, nature, or people from a custom dataset.
+
+## To accomplish this, we will use Transfer Learning by reusing the feature extraction layers of an existing Convolutional Neural Network pretrained on ImageNet.
+## We will use Keras to build our model and will use Tensorflow Datasets and TFRecord files to construct a scalable input pipeline.
+
+
+```python
+import tensorflow as tf
+import numpy as np
+from tensorflow import keras
+import matplotlib.pyplot as plt
+import glob
+import skimage
+import skimage.io
+```
+
+
+```python
+NATURE_PATH = 'nature/'
+PEOPLE_PATH = 'people/'
+FOOD_PATH = 'food/'
+
+DATA_PATH = './data/'
+```
+
+# Preprocess data and write it to several TFRecord files
+
+
+```python
+BytesList = tf.train.BytesList
+FloatList = tf.train.FloatList
+Int64List = tf.train.Int64List
+Feature = tf.train.Feature
+Features = tf.train.Features
+Example = tf.train.Example
+
+def load_images(root, path):
+    imagepaths = glob.glob(root + path + '*')
+
+    images = [skimage.io.imread(path) for path in imagepaths]
+    images = [image[:,:,:3] for image in images] # only RGB
+    return images
+
+def preprocess_image(image):
+    image = tf.constant(image, dtype=tf.float32)
+    image = tf.image.resize(image, (224,224))
+    image = tf.keras.applications.mobilenet_v2.preprocess_input(image)
+    return image
+
+def to_protobuf(image, label):
+    image_data = tf.io.serialize_tensor(image)
+    return Example(
+        features=Features(
+            feature={
+                'image': Feature(bytes_list=BytesList(value=[image_data.numpy()])),
+                'label': Feature(int64_list=Int64List(value=[label]))
+            }))
+
+def to_tfrecord(data, root, filename):
+    
+    with tf.io.TFRecordWriter(root + filename) as writer:
+        for instance in data:
+            writer.write(instance.SerializeToString())
+
+def preprocess_data(root, path, class_label, output_filename):
+    images = load_images(root, path)
+    images = [preprocess_image(image) for image in images]
+    data = [to_protobuf(image, class_label) for image in images]
+    
+    to_tfrecord(data, root, output_filename)
+
+NATURE_LABEL = 0
+PEOPLE_LABEL = 1
+FOOD_LABEL = 2
+NATURE_FILENAME = 'nature_instances.tfrecord'
+PEOPLE_FILENAME = 'people_instances.tfrecord'
+FOOD_FILENAME = 'food_instances.tfrecord'
+
+preprocess_data(DATA_PATH, NATURE_PATH, NATURE_LABEL, NATURE_FILENAME)
+preprocess_data(DATA_PATH, PEOPLE_PATH, PEOPLE_LABEL, PEOPLE_FILENAME)
+preprocess_data(DATA_PATH, FOOD_PATH, FOOD_LABEL, FOOD_FILENAME)
+```
+
+# Creat Input Pipeline/Load Data into Tensorflow Datasets
+
+
+```python
+def parse_tfrecord(tfrecord):
+    feature_descriptions = {
+        "image": tf.io.FixedLenFeature([], tf.string, default_value=""),
+        "label": tf.io.FixedLenFeature([], tf.int64, default_value=-1)
+    }
+    protobuf = tf.io.parse_single_example(tfrecord, feature_descriptions)
+    image = tf.io.parse_tensor(protobuf['image'], out_type=tf.float32)
+    
+    return image, protobuf['label']
+
+
+filepaths = [DATA_PATH + NATURE_FILENAME, 
+             DATA_PATH + PEOPLE_FILENAME,
+             DATA_PATH + FOOD_FILENAME]
+
+dataset_files = tf.data.Dataset.list_files(filepaths, seed=42)
+n_readers = 3
+dataset = dataset_files.interleave(
+                    lambda filepath: tf.data.TFRecordDataset(filepath),
+                    cycle_length=n_readers,
+                    num_parallel_calls=n_readers)
+
+dataset = dataset.map(parse_tfrecord, num_parallel_calls=6)
+
+test_dataset = dataset.take(60).batch(32)
+train_dataset = dataset.skip(60).batch(32).shuffle(390).prefetch(1)
+```
+
+# Quickly, plot some images to verify that there are no problems
+
+
+```python
+plt.figure(figsize=(20, 20))
+
+for (x, y), index in zip(test_dataset.unbatch().take(16), range(1, 100)):
+    #print(x.shape)
+    #print(np.amin(x), np.amax(x))
+    x = (x + 1.) /2.
+    print(y)
+    plt.subplot(4, 4, index)
+    plt.imshow(x)
+    
+test_dataset = dataset.take(60).batch(32) # Reset the Dataset after iterating over it
+```
+
+    tf.Tensor(2, shape=(), dtype=int64)
+    tf.Tensor(1, shape=(), dtype=int64)
+    tf.Tensor(0, shape=(), dtype=int64)
+    tf.Tensor(2, shape=(), dtype=int64)
+    tf.Tensor(1, shape=(), dtype=int64)
+    tf.Tensor(0, shape=(), dtype=int64)
+    tf.Tensor(2, shape=(), dtype=int64)
+    tf.Tensor(1, shape=(), dtype=int64)
+    tf.Tensor(0, shape=(), dtype=int64)
+    tf.Tensor(2, shape=(), dtype=int64)
+    tf.Tensor(1, shape=(), dtype=int64)
+    tf.Tensor(0, shape=(), dtype=int64)
+    tf.Tensor(2, shape=(), dtype=int64)
+    tf.Tensor(1, shape=(), dtype=int64)
+    tf.Tensor(0, shape=(), dtype=int64)
+    tf.Tensor(2, shape=(), dtype=int64)
+    
+
+
+![png](output_8_1.png)
+
+
+# Create the model using Transfer Learning (Keras Functional API)
+
+
+```python
+N_CLASSES = 3
+
+base_model = keras.applications.mobilenet_v2.MobileNetV2(weights="imagenet",
+                                                  include_top=False)
+
+avg = keras.layers.GlobalAveragePooling2D()(base_model.output)
+output = keras.layers.Dense(N_CLASSES, activation="softmax")(avg)
+model = keras.Model(inputs=base_model.input, outputs=output)
+
+for layer in base_model.layers:
+    layer.trainable = False
+    
+model.compile(loss='sparse_categorical_crossentropy', 
+              optimizer=keras.optimizers.Nadam(0.002),
+              metrics='accuracy')
+
+model.summary()
+```
+
+    WARNING:tensorflow:`input_shape` is undefined or non-square, or `rows` is not in [96, 128, 160, 192, 224]. Weights for input shape (224, 224) will be loaded as the default.
+    Downloading data from https://storage.googleapis.com/tensorflow/keras-applications/mobilenet_v2/mobilenet_v2_weights_tf_dim_ordering_tf_kernels_1.0_224_no_top.h5
+    9412608/9406464 [==============================] - 1s 0us/step
+    Model: "model_4"
+    __________________________________________________________________________________________________
+    Layer (type)                    Output Shape         Param #     Connected to                     
+    ==================================================================================================
+    input_6 (InputLayer)            [(None, None, None,  0                                            
+    __________________________________________________________________________________________________
+    Conv1_pad (ZeroPadding2D)       (None, None, None, 3 0           input_6[0][0]                    
+    __________________________________________________________________________________________________
+    Conv1 (Conv2D)                  (None, None, None, 3 864         Conv1_pad[0][0]                  
+    __________________________________________________________________________________________________
+    bn_Conv1 (BatchNormalization)   (None, None, None, 3 128         Conv1[0][0]                      
+    __________________________________________________________________________________________________
+    Conv1_relu (ReLU)               (None, None, None, 3 0           bn_Conv1[0][0]                   
+    __________________________________________________________________________________________________
+    expanded_conv_depthwise (Depthw (None, None, None, 3 288         Conv1_relu[0][0]                 
+    __________________________________________________________________________________________________
+    expanded_conv_depthwise_BN (Bat (None, None, None, 3 128         expanded_conv_depthwise[0][0]    
+    __________________________________________________________________________________________________
+    expanded_conv_depthwise_relu (R (None, None, None, 3 0           expanded_conv_depthwise_BN[0][0] 
+    __________________________________________________________________________________________________
+    expanded_conv_project (Conv2D)  (None, None, None, 1 512         expanded_conv_depthwise_relu[0][0
+    __________________________________________________________________________________________________
+    expanded_conv_project_BN (Batch (None, None, None, 1 64          expanded_conv_project[0][0]      
+    __________________________________________________________________________________________________
+    block_1_expand (Conv2D)         (None, None, None, 9 1536        expanded_conv_project_BN[0][0]   
+    __________________________________________________________________________________________________
+    block_1_expand_BN (BatchNormali (None, None, None, 9 384         block_1_expand[0][0]             
+    __________________________________________________________________________________________________
+    block_1_expand_relu (ReLU)      (None, None, None, 9 0           block_1_expand_BN[0][0]          
+    __________________________________________________________________________________________________
+    block_1_pad (ZeroPadding2D)     (None, None, None, 9 0           block_1_expand_relu[0][0]        
+    __________________________________________________________________________________________________
+    block_1_depthwise (DepthwiseCon (None, None, None, 9 864         block_1_pad[0][0]                
+    __________________________________________________________________________________________________
+    block_1_depthwise_BN (BatchNorm (None, None, None, 9 384         block_1_depthwise[0][0]          
+    __________________________________________________________________________________________________
+    block_1_depthwise_relu (ReLU)   (None, None, None, 9 0           block_1_depthwise_BN[0][0]       
+    __________________________________________________________________________________________________
+    block_1_project (Conv2D)        (None, None, None, 2 2304        block_1_depthwise_relu[0][0]     
+    __________________________________________________________________________________________________
+    block_1_project_BN (BatchNormal (None, None, None, 2 96          block_1_project[0][0]            
+    __________________________________________________________________________________________________
+    block_2_expand (Conv2D)         (None, None, None, 1 3456        block_1_project_BN[0][0]         
+    __________________________________________________________________________________________________
+    block_2_expand_BN (BatchNormali (None, None, None, 1 576         block_2_expand[0][0]             
+    __________________________________________________________________________________________________
+    block_2_expand_relu (ReLU)      (None, None, None, 1 0           block_2_expand_BN[0][0]          
+    __________________________________________________________________________________________________
+    block_2_depthwise (DepthwiseCon (None, None, None, 1 1296        block_2_expand_relu[0][0]        
+    __________________________________________________________________________________________________
+    block_2_depthwise_BN (BatchNorm (None, None, None, 1 576         block_2_depthwise[0][0]          
+    __________________________________________________________________________________________________
+    block_2_depthwise_relu (ReLU)   (None, None, None, 1 0           block_2_depthwise_BN[0][0]       
+    __________________________________________________________________________________________________
+    block_2_project (Conv2D)        (None, None, None, 2 3456        block_2_depthwise_relu[0][0]     
+    __________________________________________________________________________________________________
+    block_2_project_BN (BatchNormal (None, None, None, 2 96          block_2_project[0][0]            
+    __________________________________________________________________________________________________
+    block_2_add (Add)               (None, None, None, 2 0           block_1_project_BN[0][0]         
+                                                                     block_2_project_BN[0][0]         
+    __________________________________________________________________________________________________
+    block_3_expand (Conv2D)         (None, None, None, 1 3456        block_2_add[0][0]                
+    __________________________________________________________________________________________________
+    block_3_expand_BN (BatchNormali (None, None, None, 1 576         block_3_expand[0][0]             
+    __________________________________________________________________________________________________
+    block_3_expand_relu (ReLU)      (None, None, None, 1 0           block_3_expand_BN[0][0]          
+    __________________________________________________________________________________________________
+    block_3_pad (ZeroPadding2D)     (None, None, None, 1 0           block_3_expand_relu[0][0]        
+    __________________________________________________________________________________________________
+    block_3_depthwise (DepthwiseCon (None, None, None, 1 1296        block_3_pad[0][0]                
+    __________________________________________________________________________________________________
+    block_3_depthwise_BN (BatchNorm (None, None, None, 1 576         block_3_depthwise[0][0]          
+    __________________________________________________________________________________________________
+    block_3_depthwise_relu (ReLU)   (None, None, None, 1 0           block_3_depthwise_BN[0][0]       
+    __________________________________________________________________________________________________
+    block_3_project (Conv2D)        (None, None, None, 3 4608        block_3_depthwise_relu[0][0]     
+    __________________________________________________________________________________________________
+    block_3_project_BN (BatchNormal (None, None, None, 3 128         block_3_project[0][0]            
+    __________________________________________________________________________________________________
+    block_4_expand (Conv2D)         (None, None, None, 1 6144        block_3_project_BN[0][0]         
+    __________________________________________________________________________________________________
+    block_4_expand_BN (BatchNormali (None, None, None, 1 768         block_4_expand[0][0]             
+    __________________________________________________________________________________________________
+    block_4_expand_relu (ReLU)      (None, None, None, 1 0           block_4_expand_BN[0][0]          
+    __________________________________________________________________________________________________
+    block_4_depthwise (DepthwiseCon (None, None, None, 1 1728        block_4_expand_relu[0][0]        
+    __________________________________________________________________________________________________
+    block_4_depthwise_BN (BatchNorm (None, None, None, 1 768         block_4_depthwise[0][0]          
+    __________________________________________________________________________________________________
+    block_4_depthwise_relu (ReLU)   (None, None, None, 1 0           block_4_depthwise_BN[0][0]       
+    __________________________________________________________________________________________________
+    block_4_project (Conv2D)        (None, None, None, 3 6144        block_4_depthwise_relu[0][0]     
+    __________________________________________________________________________________________________
+    block_4_project_BN (BatchNormal (None, None, None, 3 128         block_4_project[0][0]            
+    __________________________________________________________________________________________________
+    block_4_add (Add)               (None, None, None, 3 0           block_3_project_BN[0][0]         
+                                                                     block_4_project_BN[0][0]         
+    __________________________________________________________________________________________________
+    block_5_expand (Conv2D)         (None, None, None, 1 6144        block_4_add[0][0]                
+    __________________________________________________________________________________________________
+    block_5_expand_BN (BatchNormali (None, None, None, 1 768         block_5_expand[0][0]             
+    __________________________________________________________________________________________________
+    block_5_expand_relu (ReLU)      (None, None, None, 1 0           block_5_expand_BN[0][0]          
+    __________________________________________________________________________________________________
+    block_5_depthwise (DepthwiseCon (None, None, None, 1 1728        block_5_expand_relu[0][0]        
+    __________________________________________________________________________________________________
+    block_5_depthwise_BN (BatchNorm (None, None, None, 1 768         block_5_depthwise[0][0]          
+    __________________________________________________________________________________________________
+    block_5_depthwise_relu (ReLU)   (None, None, None, 1 0           block_5_depthwise_BN[0][0]       
+    __________________________________________________________________________________________________
+    block_5_project (Conv2D)        (None, None, None, 3 6144        block_5_depthwise_relu[0][0]     
+    __________________________________________________________________________________________________
+    block_5_project_BN (BatchNormal (None, None, None, 3 128         block_5_project[0][0]            
+    __________________________________________________________________________________________________
+    block_5_add (Add)               (None, None, None, 3 0           block_4_add[0][0]                
+                                                                     block_5_project_BN[0][0]         
+    __________________________________________________________________________________________________
+    block_6_expand (Conv2D)         (None, None, None, 1 6144        block_5_add[0][0]                
+    __________________________________________________________________________________________________
+    block_6_expand_BN (BatchNormali (None, None, None, 1 768         block_6_expand[0][0]             
+    __________________________________________________________________________________________________
+    block_6_expand_relu (ReLU)      (None, None, None, 1 0           block_6_expand_BN[0][0]          
+    __________________________________________________________________________________________________
+    block_6_pad (ZeroPadding2D)     (None, None, None, 1 0           block_6_expand_relu[0][0]        
+    __________________________________________________________________________________________________
+    block_6_depthwise (DepthwiseCon (None, None, None, 1 1728        block_6_pad[0][0]                
+    __________________________________________________________________________________________________
+    block_6_depthwise_BN (BatchNorm (None, None, None, 1 768         block_6_depthwise[0][0]          
+    __________________________________________________________________________________________________
+    block_6_depthwise_relu (ReLU)   (None, None, None, 1 0           block_6_depthwise_BN[0][0]       
+    __________________________________________________________________________________________________
+    block_6_project (Conv2D)        (None, None, None, 6 12288       block_6_depthwise_relu[0][0]     
+    __________________________________________________________________________________________________
+    block_6_project_BN (BatchNormal (None, None, None, 6 256         block_6_project[0][0]            
+    __________________________________________________________________________________________________
+    block_7_expand (Conv2D)         (None, None, None, 3 24576       block_6_project_BN[0][0]         
+    __________________________________________________________________________________________________
+    block_7_expand_BN (BatchNormali (None, None, None, 3 1536        block_7_expand[0][0]             
+    __________________________________________________________________________________________________
+    block_7_expand_relu (ReLU)      (None, None, None, 3 0           block_7_expand_BN[0][0]          
+    __________________________________________________________________________________________________
+    block_7_depthwise (DepthwiseCon (None, None, None, 3 3456        block_7_expand_relu[0][0]        
+    __________________________________________________________________________________________________
+    block_7_depthwise_BN (BatchNorm (None, None, None, 3 1536        block_7_depthwise[0][0]          
+    __________________________________________________________________________________________________
+    block_7_depthwise_relu (ReLU)   (None, None, None, 3 0           block_7_depthwise_BN[0][0]       
+    __________________________________________________________________________________________________
+    block_7_project (Conv2D)        (None, None, None, 6 24576       block_7_depthwise_relu[0][0]     
+    __________________________________________________________________________________________________
+    block_7_project_BN (BatchNormal (None, None, None, 6 256         block_7_project[0][0]            
+    __________________________________________________________________________________________________
+    block_7_add (Add)               (None, None, None, 6 0           block_6_project_BN[0][0]         
+                                                                     block_7_project_BN[0][0]         
+    __________________________________________________________________________________________________
+    block_8_expand (Conv2D)         (None, None, None, 3 24576       block_7_add[0][0]                
+    __________________________________________________________________________________________________
+    block_8_expand_BN (BatchNormali (None, None, None, 3 1536        block_8_expand[0][0]             
+    __________________________________________________________________________________________________
+    block_8_expand_relu (ReLU)      (None, None, None, 3 0           block_8_expand_BN[0][0]          
+    __________________________________________________________________________________________________
+    block_8_depthwise (DepthwiseCon (None, None, None, 3 3456        block_8_expand_relu[0][0]        
+    __________________________________________________________________________________________________
+    block_8_depthwise_BN (BatchNorm (None, None, None, 3 1536        block_8_depthwise[0][0]          
+    __________________________________________________________________________________________________
+    block_8_depthwise_relu (ReLU)   (None, None, None, 3 0           block_8_depthwise_BN[0][0]       
+    __________________________________________________________________________________________________
+    block_8_project (Conv2D)        (None, None, None, 6 24576       block_8_depthwise_relu[0][0]     
+    __________________________________________________________________________________________________
+    block_8_project_BN (BatchNormal (None, None, None, 6 256         block_8_project[0][0]            
+    __________________________________________________________________________________________________
+    block_8_add (Add)               (None, None, None, 6 0           block_7_add[0][0]                
+                                                                     block_8_project_BN[0][0]         
+    __________________________________________________________________________________________________
+    block_9_expand (Conv2D)         (None, None, None, 3 24576       block_8_add[0][0]                
+    __________________________________________________________________________________________________
+    block_9_expand_BN (BatchNormali (None, None, None, 3 1536        block_9_expand[0][0]             
+    __________________________________________________________________________________________________
+    block_9_expand_relu (ReLU)      (None, None, None, 3 0           block_9_expand_BN[0][0]          
+    __________________________________________________________________________________________________
+    block_9_depthwise (DepthwiseCon (None, None, None, 3 3456        block_9_expand_relu[0][0]        
+    __________________________________________________________________________________________________
+    block_9_depthwise_BN (BatchNorm (None, None, None, 3 1536        block_9_depthwise[0][0]          
+    __________________________________________________________________________________________________
+    block_9_depthwise_relu (ReLU)   (None, None, None, 3 0           block_9_depthwise_BN[0][0]       
+    __________________________________________________________________________________________________
+    block_9_project (Conv2D)        (None, None, None, 6 24576       block_9_depthwise_relu[0][0]     
+    __________________________________________________________________________________________________
+    block_9_project_BN (BatchNormal (None, None, None, 6 256         block_9_project[0][0]            
+    __________________________________________________________________________________________________
+    block_9_add (Add)               (None, None, None, 6 0           block_8_add[0][0]                
+                                                                     block_9_project_BN[0][0]         
+    __________________________________________________________________________________________________
+    block_10_expand (Conv2D)        (None, None, None, 3 24576       block_9_add[0][0]                
+    __________________________________________________________________________________________________
+    block_10_expand_BN (BatchNormal (None, None, None, 3 1536        block_10_expand[0][0]            
+    __________________________________________________________________________________________________
+    block_10_expand_relu (ReLU)     (None, None, None, 3 0           block_10_expand_BN[0][0]         
+    __________________________________________________________________________________________________
+    block_10_depthwise (DepthwiseCo (None, None, None, 3 3456        block_10_expand_relu[0][0]       
+    __________________________________________________________________________________________________
+    block_10_depthwise_BN (BatchNor (None, None, None, 3 1536        block_10_depthwise[0][0]         
+    __________________________________________________________________________________________________
+    block_10_depthwise_relu (ReLU)  (None, None, None, 3 0           block_10_depthwise_BN[0][0]      
+    __________________________________________________________________________________________________
+    block_10_project (Conv2D)       (None, None, None, 9 36864       block_10_depthwise_relu[0][0]    
+    __________________________________________________________________________________________________
+    block_10_project_BN (BatchNorma (None, None, None, 9 384         block_10_project[0][0]           
+    __________________________________________________________________________________________________
+    block_11_expand (Conv2D)        (None, None, None, 5 55296       block_10_project_BN[0][0]        
+    __________________________________________________________________________________________________
+    block_11_expand_BN (BatchNormal (None, None, None, 5 2304        block_11_expand[0][0]            
+    __________________________________________________________________________________________________
+    block_11_expand_relu (ReLU)     (None, None, None, 5 0           block_11_expand_BN[0][0]         
+    __________________________________________________________________________________________________
+    block_11_depthwise (DepthwiseCo (None, None, None, 5 5184        block_11_expand_relu[0][0]       
+    __________________________________________________________________________________________________
+    block_11_depthwise_BN (BatchNor (None, None, None, 5 2304        block_11_depthwise[0][0]         
+    __________________________________________________________________________________________________
+    block_11_depthwise_relu (ReLU)  (None, None, None, 5 0           block_11_depthwise_BN[0][0]      
+    __________________________________________________________________________________________________
+    block_11_project (Conv2D)       (None, None, None, 9 55296       block_11_depthwise_relu[0][0]    
+    __________________________________________________________________________________________________
+    block_11_project_BN (BatchNorma (None, None, None, 9 384         block_11_project[0][0]           
+    __________________________________________________________________________________________________
+    block_11_add (Add)              (None, None, None, 9 0           block_10_project_BN[0][0]        
+                                                                     block_11_project_BN[0][0]        
+    __________________________________________________________________________________________________
+    block_12_expand (Conv2D)        (None, None, None, 5 55296       block_11_add[0][0]               
+    __________________________________________________________________________________________________
+    block_12_expand_BN (BatchNormal (None, None, None, 5 2304        block_12_expand[0][0]            
+    __________________________________________________________________________________________________
+    block_12_expand_relu (ReLU)     (None, None, None, 5 0           block_12_expand_BN[0][0]         
+    __________________________________________________________________________________________________
+    block_12_depthwise (DepthwiseCo (None, None, None, 5 5184        block_12_expand_relu[0][0]       
+    __________________________________________________________________________________________________
+    block_12_depthwise_BN (BatchNor (None, None, None, 5 2304        block_12_depthwise[0][0]         
+    __________________________________________________________________________________________________
+    block_12_depthwise_relu (ReLU)  (None, None, None, 5 0           block_12_depthwise_BN[0][0]      
+    __________________________________________________________________________________________________
+    block_12_project (Conv2D)       (None, None, None, 9 55296       block_12_depthwise_relu[0][0]    
+    __________________________________________________________________________________________________
+    block_12_project_BN (BatchNorma (None, None, None, 9 384         block_12_project[0][0]           
+    __________________________________________________________________________________________________
+    block_12_add (Add)              (None, None, None, 9 0           block_11_add[0][0]               
+                                                                     block_12_project_BN[0][0]        
+    __________________________________________________________________________________________________
+    block_13_expand (Conv2D)        (None, None, None, 5 55296       block_12_add[0][0]               
+    __________________________________________________________________________________________________
+    block_13_expand_BN (BatchNormal (None, None, None, 5 2304        block_13_expand[0][0]            
+    __________________________________________________________________________________________________
+    block_13_expand_relu (ReLU)     (None, None, None, 5 0           block_13_expand_BN[0][0]         
+    __________________________________________________________________________________________________
+    block_13_pad (ZeroPadding2D)    (None, None, None, 5 0           block_13_expand_relu[0][0]       
+    __________________________________________________________________________________________________
+    block_13_depthwise (DepthwiseCo (None, None, None, 5 5184        block_13_pad[0][0]               
+    __________________________________________________________________________________________________
+    block_13_depthwise_BN (BatchNor (None, None, None, 5 2304        block_13_depthwise[0][0]         
+    __________________________________________________________________________________________________
+    block_13_depthwise_relu (ReLU)  (None, None, None, 5 0           block_13_depthwise_BN[0][0]      
+    __________________________________________________________________________________________________
+    block_13_project (Conv2D)       (None, None, None, 1 92160       block_13_depthwise_relu[0][0]    
+    __________________________________________________________________________________________________
+    block_13_project_BN (BatchNorma (None, None, None, 1 640         block_13_project[0][0]           
+    __________________________________________________________________________________________________
+    block_14_expand (Conv2D)        (None, None, None, 9 153600      block_13_project_BN[0][0]        
+    __________________________________________________________________________________________________
+    block_14_expand_BN (BatchNormal (None, None, None, 9 3840        block_14_expand[0][0]            
+    __________________________________________________________________________________________________
+    block_14_expand_relu (ReLU)     (None, None, None, 9 0           block_14_expand_BN[0][0]         
+    __________________________________________________________________________________________________
+    block_14_depthwise (DepthwiseCo (None, None, None, 9 8640        block_14_expand_relu[0][0]       
+    __________________________________________________________________________________________________
+    block_14_depthwise_BN (BatchNor (None, None, None, 9 3840        block_14_depthwise[0][0]         
+    __________________________________________________________________________________________________
+    block_14_depthwise_relu (ReLU)  (None, None, None, 9 0           block_14_depthwise_BN[0][0]      
+    __________________________________________________________________________________________________
+    block_14_project (Conv2D)       (None, None, None, 1 153600      block_14_depthwise_relu[0][0]    
+    __________________________________________________________________________________________________
+    block_14_project_BN (BatchNorma (None, None, None, 1 640         block_14_project[0][0]           
+    __________________________________________________________________________________________________
+    block_14_add (Add)              (None, None, None, 1 0           block_13_project_BN[0][0]        
+                                                                     block_14_project_BN[0][0]        
+    __________________________________________________________________________________________________
+    block_15_expand (Conv2D)        (None, None, None, 9 153600      block_14_add[0][0]               
+    __________________________________________________________________________________________________
+    block_15_expand_BN (BatchNormal (None, None, None, 9 3840        block_15_expand[0][0]            
+    __________________________________________________________________________________________________
+    block_15_expand_relu (ReLU)     (None, None, None, 9 0           block_15_expand_BN[0][0]         
+    __________________________________________________________________________________________________
+    block_15_depthwise (DepthwiseCo (None, None, None, 9 8640        block_15_expand_relu[0][0]       
+    __________________________________________________________________________________________________
+    block_15_depthwise_BN (BatchNor (None, None, None, 9 3840        block_15_depthwise[0][0]         
+    __________________________________________________________________________________________________
+    block_15_depthwise_relu (ReLU)  (None, None, None, 9 0           block_15_depthwise_BN[0][0]      
+    __________________________________________________________________________________________________
+    block_15_project (Conv2D)       (None, None, None, 1 153600      block_15_depthwise_relu[0][0]    
+    __________________________________________________________________________________________________
+    block_15_project_BN (BatchNorma (None, None, None, 1 640         block_15_project[0][0]           
+    __________________________________________________________________________________________________
+    block_15_add (Add)              (None, None, None, 1 0           block_14_add[0][0]               
+                                                                     block_15_project_BN[0][0]        
+    __________________________________________________________________________________________________
+    block_16_expand (Conv2D)        (None, None, None, 9 153600      block_15_add[0][0]               
+    __________________________________________________________________________________________________
+    block_16_expand_BN (BatchNormal (None, None, None, 9 3840        block_16_expand[0][0]            
+    __________________________________________________________________________________________________
+    block_16_expand_relu (ReLU)     (None, None, None, 9 0           block_16_expand_BN[0][0]         
+    __________________________________________________________________________________________________
+    block_16_depthwise (DepthwiseCo (None, None, None, 9 8640        block_16_expand_relu[0][0]       
+    __________________________________________________________________________________________________
+    block_16_depthwise_BN (BatchNor (None, None, None, 9 3840        block_16_depthwise[0][0]         
+    __________________________________________________________________________________________________
+    block_16_depthwise_relu (ReLU)  (None, None, None, 9 0           block_16_depthwise_BN[0][0]      
+    __________________________________________________________________________________________________
+    block_16_project (Conv2D)       (None, None, None, 3 307200      block_16_depthwise_relu[0][0]    
+    __________________________________________________________________________________________________
+    block_16_project_BN (BatchNorma (None, None, None, 3 1280        block_16_project[0][0]           
+    __________________________________________________________________________________________________
+    Conv_1 (Conv2D)                 (None, None, None, 1 409600      block_16_project_BN[0][0]        
+    __________________________________________________________________________________________________
+    Conv_1_bn (BatchNormalization)  (None, None, None, 1 5120        Conv_1[0][0]                     
+    __________________________________________________________________________________________________
+    out_relu (ReLU)                 (None, None, None, 1 0           Conv_1_bn[0][0]                  
+    __________________________________________________________________________________________________
+    global_average_pooling2d_3 (Glo (None, 1280)         0           out_relu[0][0]                   
+    __________________________________________________________________________________________________
+    dense_5 (Dense)                 (None, 3)            3843        global_average_pooling2d_3[0][0] 
+    ==================================================================================================
+    Total params: 2,261,827
+    Trainable params: 3,843
+    Non-trainable params: 2,257,984
+    __________________________________________________________________________________________________
+    [(None, None, None, 3)]
+    (None, None, None, 3)
+    (None, None, None, 32)
+    (None, None, None, 32)
+    (None, None, None, 32)
+    (None, None, None, 32)
+    (None, None, None, 32)
+    (None, None, None, 32)
+    (None, None, None, 16)
+    (None, None, None, 16)
+    (None, None, None, 96)
+    (None, None, None, 96)
+    (None, None, None, 96)
+    (None, None, None, 96)
+    (None, None, None, 96)
+    (None, None, None, 96)
+    (None, None, None, 96)
+    (None, None, None, 24)
+    (None, None, None, 24)
+    (None, None, None, 144)
+    (None, None, None, 144)
+    (None, None, None, 144)
+    (None, None, None, 144)
+    (None, None, None, 144)
+    (None, None, None, 144)
+    (None, None, None, 24)
+    (None, None, None, 24)
+    (None, None, None, 24)
+    (None, None, None, 144)
+    (None, None, None, 144)
+    (None, None, None, 144)
+    (None, None, None, 144)
+    (None, None, None, 144)
+    (None, None, None, 144)
+    (None, None, None, 144)
+    (None, None, None, 32)
+    (None, None, None, 32)
+    (None, None, None, 192)
+    (None, None, None, 192)
+    (None, None, None, 192)
+    (None, None, None, 192)
+    (None, None, None, 192)
+    (None, None, None, 192)
+    (None, None, None, 32)
+    (None, None, None, 32)
+    (None, None, None, 32)
+    (None, None, None, 192)
+    (None, None, None, 192)
+    (None, None, None, 192)
+    (None, None, None, 192)
+    (None, None, None, 192)
+    (None, None, None, 192)
+    (None, None, None, 32)
+    (None, None, None, 32)
+    (None, None, None, 32)
+    (None, None, None, 192)
+    (None, None, None, 192)
+    (None, None, None, 192)
+    (None, None, None, 192)
+    (None, None, None, 192)
+    (None, None, None, 192)
+    (None, None, None, 192)
+    (None, None, None, 64)
+    (None, None, None, 64)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 64)
+    (None, None, None, 64)
+    (None, None, None, 64)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 64)
+    (None, None, None, 64)
+    (None, None, None, 64)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 64)
+    (None, None, None, 64)
+    (None, None, None, 64)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 384)
+    (None, None, None, 96)
+    (None, None, None, 96)
+    (None, None, None, 576)
+    (None, None, None, 576)
+    (None, None, None, 576)
+    (None, None, None, 576)
+    (None, None, None, 576)
+    (None, None, None, 576)
+    (None, None, None, 96)
+    (None, None, None, 96)
+    (None, None, None, 96)
+    (None, None, None, 576)
+    (None, None, None, 576)
+    (None, None, None, 576)
+    (None, None, None, 576)
+    (None, None, None, 576)
+    (None, None, None, 576)
+    (None, None, None, 96)
+    (None, None, None, 96)
+    (None, None, None, 96)
+    (None, None, None, 576)
+    (None, None, None, 576)
+    (None, None, None, 576)
+    (None, None, None, 576)
+    (None, None, None, 576)
+    (None, None, None, 576)
+    (None, None, None, 576)
+    (None, None, None, 160)
+    (None, None, None, 160)
+    (None, None, None, 960)
+    (None, None, None, 960)
+    (None, None, None, 960)
+    (None, None, None, 960)
+    (None, None, None, 960)
+    (None, None, None, 960)
+    (None, None, None, 160)
+    (None, None, None, 160)
+    (None, None, None, 160)
+    (None, None, None, 960)
+    (None, None, None, 960)
+    (None, None, None, 960)
+    (None, None, None, 960)
+    (None, None, None, 960)
+    (None, None, None, 960)
+    (None, None, None, 160)
+    (None, None, None, 160)
+    (None, None, None, 160)
+    (None, None, None, 960)
+    (None, None, None, 960)
+    (None, None, None, 960)
+    (None, None, None, 960)
+    (None, None, None, 960)
+    (None, None, None, 960)
+    (None, None, None, 320)
+    (None, None, None, 320)
+    (None, None, None, 1280)
+    (None, None, None, 1280)
+    (None, None, None, 1280)
+    (None, 1280)
+    (None, 3)
+    
+
+# Train the model
+
+
+```python
+import datetime
+
+log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+tensorboard = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1, profile_batch=(10,10))
+earlystopping = tf.keras.callbacks.EarlyStopping(patience=2, restore_best_weights=True)
+
+history = model.fit(train_dataset, epochs=10, validation_data=(test_dataset),
+                   metrics=[tensorboard, earlystopping])
+```
+
+    Epoch 1/10
+    13/13 [==============================] - 44s 3s/step - loss: 0.6851 - accuracy: 0.6872 - val_loss: 0.2462 - val_accuracy: 0.9500
+    Epoch 2/10
+    13/13 [==============================] - 47s 4s/step - loss: 0.2002 - accuracy: 0.9667 - val_loss: 0.1005 - val_accuracy: 0.9500
+    Epoch 3/10
+    13/13 [==============================] - 47s 4s/step - loss: 0.0960 - accuracy: 0.9897 - val_loss: 0.0566 - val_accuracy: 1.0000
+    Epoch 4/10
+    13/13 [==============================] - 41s 3s/step - loss: 0.0644 - accuracy: 0.9923 - val_loss: 0.0386 - val_accuracy: 1.0000
+    Epoch 5/10
+    13/13 [==============================] - 43s 3s/step - loss: 0.0459 - accuracy: 0.9974 - val_loss: 0.0339 - val_accuracy: 1.0000
+    Epoch 6/10
+    13/13 [==============================] - 43s 3s/step - loss: 0.0338 - accuracy: 1.0000 - val_loss: 0.0290 - val_accuracy: 1.0000
+    Epoch 7/10
+    13/13 [==============================] - 43s 3s/step - loss: 0.0283 - accuracy: 1.0000 - val_loss: 0.0242 - val_accuracy: 1.0000
+    Epoch 8/10
+    13/13 [==============================] - 45s 3s/step - loss: 0.0234 - accuracy: 1.0000 - val_loss: 0.0246 - val_accuracy: 1.0000
+    Epoch 9/10
+    13/13 [==============================] - 42s 3s/step - loss: 0.0197 - accuracy: 1.0000 - val_loss: 0.0201 - val_accuracy: 1.0000
+    Epoch 10/10
+    13/13 [==============================] - 44s 3s/step - loss: 0.0166 - accuracy: 1.0000 - val_loss: 0.0185 - val_accuracy: 1.0000
+    
+
+# Save the model
+
+
+```python
+model.save("model.h5")
+```
+
+
+```python
+loaded_model = keras.models.load_model("model.h5")
+
+loaded_model.evaluate(test_dataset) # Verify
+```
+
+    WARNING:tensorflow:Error in loading the saved optimizer state. As a result, your model is starting with a freshly initialized optimizer.
+    2/2 [==============================] - 1s 312ms/step - loss: 0.0185 - accuracy: 1.0000
+    
+
+
+
+
+    [0.0185115784406662, 1.0]
+
+
+
+# Final Test
+
+
+```python
+TEST_PATH = 'test/'
+DATA_PATH = './data/'
+
+images = load_images(DATA_PATH, TEST_PATH)
+images = [preprocess_image(image) for image in images]
+
+images = np.array(images)
+```
+
+
+```python
+preds = model.predict(images)
+label_preds = np.argmax(preds, axis=1)
+```
+
+
+```python
+labels = ['nature', 'person', 'food']
+NATURE_LABEL, PEOPLE_LABEL, FOOD_LABEL
+```
+
+
+
+
+    (0, 1, 2)
+
+
+
+
+```python
+plt.figure(figsize=(20, 20))
+
+for image, label, probabilities, index in zip(images, label_preds, preds, range(1,10)):
+    image = (image + 1.) /2.
+
+    plt.subplot(3, 3, index)
+    plt.imshow(image)
+    plt.title(labels[label] + '    ' + str(probabilities))
+```
+
+
+![png](output_20_0.png)
+
+
+
+```python
+
+```
