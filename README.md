@@ -1,4 +1,4 @@
-# In this notebook we will build and train a Convolutional Neural Network for classifying images as food, nature, or people from a custom dataset.
+# In this notebook we will build and train a Convolutional Neural Network for classifying images as food, nature, or people. However, any custom dataset can be used.
 
 ## To accomplish this, we will use Transfer Learning by reusing the feature extraction layers of an existing Convolutional Neural Network pretrained on ImageNet.
 ## We will use Keras to build our model and will use Tensorflow Datasets and TFRecord files to construct a scalable input pipeline.
